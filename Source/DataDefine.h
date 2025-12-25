@@ -1,10 +1,16 @@
 #ifndef DATA_DEFINE_HEADER_H
 #define DATA_DEFINE_HEADER_H
 
-#include<windows.h>
-#include<string>
+#include <winsock2.h>
+#include <windows.h>
+#include <string>
 #include <iostream>
+#include <cstdint>
+#include <vector>
 
+
+
+// 确保结构体1字节对齐，防止不同编译器/平台产生不同的 Padding
 #pragma pack(push, 1)
 
 
@@ -12,6 +18,9 @@ const uint16_t PACKET_MAGIC = 0xABCD;
 const uint16_t PACKET_VERSION = 0x100;
 
 const uint32_t MAX_PACKET_SIZE = 10 * 1024 * 1024;
+
+// 最大包体长度限制 (10MB)，防止非法大包耗尽内存
+const uint64_t MAX_PACKET_BODY_SIZE = 10 * 1024 * 1024;
 
 
 //客户端和服务端通讯的消息类型定义
@@ -33,22 +42,14 @@ enum class CommandType : uint16_t
 
 // 协议包头结构体
 // 用于描述数据包的基础信息，位于每个数据包的最前端
-typedef struct _PacketHeader
+// 注意：网络传输时必须使用网络字节序 (Big-Endian)
+typedef struct PacketHeader
 {
-    // 默认构造函数，初始化所有字段为 0
-    _PacketHeader()
-    {
-        magic = 0;
-        version = 0;
-        cmd = 0;
-        seq = 0;
-        body_len = 0;
-    }
-    uint16_t magic;      // 魔数 (2字节): 固定值 0xABCD，用于校验数据包合法性，防止协议错乱
-    uint16_t version;    // 版本号 (2字节): 协议版本，用于兼容性处理 (如 Ver 1, Ver 2)
-    uint16_t cmd;        // 命令字 (2字节): 标识当前包的业务类型 (如 0x0003=登录请求)
-    uint16_t seq;        // 序列号 (2字节): 用于请求/响应匹配，异步通信中标记是哪一次请求
-    uint32_t body_len;   // 包体长度 (4字节): 标识 Header 之后跟随的数据长度，用于处理 TCP 粘包
+    uint16_t magic;      // 0xABCD
+    uint16_t version;    // 0x0100
+    uint16_t cmd;        // 命令字
+    uint16_t seq;        // 序列号
+    uint64_t body_len;   // 包体长度
 } PacketHeader;
 
 #pragma pack(pop)
@@ -71,7 +72,23 @@ enum class ClientState {
     Authenticated   // [已认证]: 登录成功，可以正常收发业务数据和心跳
 };
 
+// 辅助函数：64位网络字节序转换 (避免与系统 htonll 冲突，使用自定义名称)
+inline uint64_t HostToNetwork64(uint64_t val)
+{
+    static const int num = 42;
+    if (*reinterpret_cast<const char*>(&num) == num)
+    {
+        // 小端序机器 (Intel/AMD)，需要转换
+        return ((uint64_t)htonl((uint32_t)val)) << 32 | htonl((uint32_t)(val >> 32));
+    }
+    // 大端序机器，不需要转换
+    return val;
+}
 
+inline uint64_t NetworkToHost64(uint64_t val)
+{
+    return HostToNetwork64(val);
+}
 
 
 

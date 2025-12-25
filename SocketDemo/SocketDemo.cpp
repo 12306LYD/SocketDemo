@@ -17,7 +17,7 @@ void RunServer() {
 // 简单封装一个 Client 的启动逻辑
 void RunClient() {
     Client client;
-    client.SetToken("user123","123","33333");
+    client.SetToken("use123","2222","111111");
     client.Start("127.0.0.1", 8080);
     
     std::cout << "Client started. Type 'quit' to exit or any other text to send message." << std::endl;
@@ -39,14 +39,24 @@ int main(int argc, char* argv[]) {
     // 确保控制台支持中文输出
     system("chcp 65001"); 
 
-    std::cout << "Select mode:" << std::endl;
-    std::cout << "1. Server" << std::endl;
-    std::cout << "2. Client" << std::endl;
-    std::cout << "> ";
+    int choice = 0;
+    if (argc > 1)
+    {
+        std::string arg = argv[1];
+        if (arg == "--server") choice = 1;
+        else if (arg == "--client") choice = 2;
+    }
 
-    int choice;
-    std::cin >> choice;
-    std::cin.get(); // Consume newline
+    if (choice == 0)
+    {
+        std::cout << "Select mode:" << std::endl;
+        std::cout << "1. Server" << std::endl;
+        std::cout << "2. Client" << std::endl;
+        std::cout << "> ";
+
+        std::cin >> choice;
+        std::cin.get(); // Consume newline
+    }
 
     if (choice == 1) {
         RunServer();

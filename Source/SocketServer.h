@@ -23,6 +23,13 @@ struct ClientSession
     bool isAuthenticated; // 是否已登录
     std::chrono::steady_clock::time_point lastHeartbeatTime; // 最后一次心跳时间
     std::string username;
+    
+    // 接收缓冲区 (每个客户端独立)
+    std::vector<char> recvBuffer;
+
+    // 发送缓冲区
+    std::vector<char> sendBuffer;
+    std::mutex sendMutex;
 
     ClientSession() 
         : socket(INVALID_SOCKET)
@@ -46,15 +53,26 @@ public:
 private:
     // 网络线程主函数 (使用 Select 模型处理多路复用)
     void NetworkThreadFunc();
+    
+    // 设置 Socket 为非阻塞模式
+    bool SetNonBlocking(SOCKET sock, bool nonBlocking);
 
-    // 发送数据包给指定客户端
-    bool SendPacket(SOCKET sock, uint16_t cmd, const void* data = nullptr, uint32_t len = 0);
+    // 发送数据包给指定客户端 (追加到发送缓冲区)
+    bool SendPacket(std::shared_ptr<ClientSession> session, uint16_t cmd, const void* data = nullptr, uint64_t len = 0);
+    // 旧的 SendPacket (通过 socket 发送) 已废弃，为了兼容性保留重载，但内部会调用上面的版本
+    bool SendPacket(SOCKET sock, uint16_t cmd, const void* data = nullptr, uint64_t len = 0);
 
-    // 接收指定长度的数据
-    bool RecvFixedSize(SOCKET sock, void* buf, int len);
+    // 尝试发送 Session 发送缓冲区的数据
+    void SendFromBuffer(std::shared_ptr<ClientSession> session);
 
-    // 处理单个客户端的消息
-    void HandleClientPacket(std::shared_ptr<ClientSession> session);
+    // 非阻塞接收数据并存入 Session 缓冲区
+    void RecvToBuffer(std::shared_ptr<ClientSession> session);
+
+    // 处理 Session 缓冲区中的数据 (切包)
+    void ProcessBuffer(std::shared_ptr<ClientSession> session);
+
+    // 处理单个数据包
+    void HandlePacket(std::shared_ptr<ClientSession> session, const PacketHeader& header, const std::vector<char>& body);
 
     // 业务处理函数
     void OnLoginReq(std::shared_ptr<ClientSession> session, const std::vector<char>& body);

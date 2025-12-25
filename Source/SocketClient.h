@@ -2,7 +2,6 @@
 #define SOCKET_CLIENT_HEADER_H
 
 #include"DataDefine.h"
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <thread>
@@ -40,17 +39,23 @@ private:
     // 尝试连接服务器
     bool ConnectToServer();
     
+    // 设置 Socket 为非阻塞模式
+    bool SetNonBlocking(bool nonBlocking);
+
     // 关闭 Socket
     void CloseSocket();
 
-    // 发送协议包
-    bool SendPacket(uint16_t cmd, const void* data = nullptr, uint32_t len = 0);
+    // 发送协议包 (只放入发送缓冲区)
+    bool SendPacket(uint16_t cmd, const void* data = nullptr, uint64_t len = 0);
     
-    // 接收指定长度的数据 (阻塞直到收满或出错)
-    bool RecvFixedSize(void* buf, int len);
+    // 非阻塞接收数据并存入缓冲区
+    void RecvToBuffer();
 
-    // 接收并处理一个完整的数据包
-    void ReceiveAndProcessPacket();
+    // 尝试发送发送缓冲区的数据
+    void SendFromBuffer();
+
+    // 处理缓冲区中的数据 (切包)
+    void ProcessBuffer();
 
     // 处理接收到的包
     void HandlePacket(const PacketHeader& header, const std::vector<char>& body);
@@ -79,6 +84,13 @@ private:
     std::string m_username;
     std::string m_password;
     std::string m_deviceId;
+
+    // 接收缓冲区
+    std::vector<char> m_recvBuffer;
+
+    // 发送缓冲区
+    std::vector<char> m_sendBuffer;
+    std::mutex m_sendBufferMutex;
 };
 
 

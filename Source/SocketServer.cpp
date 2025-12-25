@@ -86,9 +86,10 @@ void Server::NetworkThreadFunc()
     {
         fd_set readfds;
         FD_ZERO(&readfds);
-
-        // Add listen socket
         FD_SET(m_listenSocket, &readfds);
+
+        fd_set writefds;
+        FD_ZERO(&writefds);
 
         // Add all client sockets
         SOCKET maxSock = m_listenSocket;
@@ -96,10 +97,22 @@ void Server::NetworkThreadFunc()
             std::lock_guard<std::mutex> lock(m_clientsMutex);
             for (auto& pair : m_clients)
             {
-                FD_SET(pair.first, &readfds);
-                if (pair.first > maxSock)
+                SOCKET s = pair.first;
+                std::shared_ptr<ClientSession> session = pair.second;
+
+                FD_SET(s, &readfds);
+                if (s > maxSock)
                 {
-                    maxSock = pair.first;
+                    maxSock = s;
+                }
+
+                // Check if we need to send data
+                {
+                    std::lock_guard<std::mutex> sendLock(session->sendMutex);
+                    if (!session->sendBuffer.empty())
+                    {
+                        FD_SET(s, &writefds);
+                    }
                 }
             }
         }
@@ -109,7 +122,7 @@ void Server::NetworkThreadFunc()
         tv.tv_usec = 100 * 1000; // 100ms
 
         // In Windows, the first param (nfds) is ignored, but for logic sake let's keep it simple
-        int ret = select(0, &readfds, NULL, NULL, &tv);
+        int ret = select(0, &readfds, &writefds, NULL, &tv);
 
         if (ret > 0)
         {
@@ -125,33 +138,55 @@ void Server::NetworkThreadFunc()
                     session->socket = clientSock;
                     session->addr = clientAddr;
                     session->lastHeartbeatTime = std::chrono::steady_clock::now();
-
-                    char ipStr[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, INET_ADDRSTRLEN);
-                    std::cout << "[Server] New connection from " << ipStr << ":" << ntohs(clientAddr.sin_port) << std::endl;
-
-                    std::lock_guard<std::mutex> lock(m_clientsMutex);
-                    m_clients[clientSock] = session;
-                }
-            }
-
-            // 2. Check client sockets for data
-            // We need to copy keys first because we might modify the map (remove client) during iteration
-            std::vector<std::shared_ptr<ClientSession>> sessionsToCheck;
-            {
-                std::lock_guard<std::mutex> lock(m_clientsMutex);
-                for (auto& pair : m_clients)
-                {
-                    if (FD_ISSET(pair.first, &readfds))
+                    session->recvBuffer.clear();
                     {
-                        sessionsToCheck.push_back(pair.second);
+                        std::lock_guard<std::mutex> lock(session->sendMutex);
+                        session->sendBuffer.clear();
+                    }
+
+                    // 设置非阻塞模式
+                    if (!SetNonBlocking(clientSock, true))
+                    {
+                         std::cout << "[Server] Failed to set non-blocking for client." << std::endl;
+                         closesocket(clientSock);
+                    }
+                    else
+                    {
+                        char ipStr[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, INET_ADDRSTRLEN);
+                        std::cout << "[Server] New connection from " << ipStr << ":" << ntohs(clientAddr.sin_port) << std::endl;
+
+                        std::lock_guard<std::mutex> lock(m_clientsMutex);
+                        m_clients[clientSock] = session;
                     }
                 }
             }
 
-            for (auto& session : sessionsToCheck)
+            // 2. Check client sockets for data (Read & Write)
+            std::vector<std::shared_ptr<ClientSession>> sessionsToProcess;
             {
-                HandleClientPacket(session);
+                std::lock_guard<std::mutex> lock(m_clientsMutex);
+                for (auto& pair : m_clients)
+                {
+                    if (FD_ISSET(pair.first, &readfds) || FD_ISSET(pair.first, &writefds))
+                    {
+                        sessionsToProcess.push_back(pair.second);
+                    }
+                }
+            }
+
+            for (auto& session : sessionsToProcess)
+            {
+                if (FD_ISSET(session->socket, &readfds))
+                {
+                    RecvToBuffer(session);
+                    ProcessBuffer(session);
+                }
+
+                if (FD_ISSET(session->socket, &writefds))
+                {
+                    SendFromBuffer(session);
+                }
             }
         }
 
@@ -178,44 +213,114 @@ void Server::NetworkThreadFunc()
     }
 }
 
-void Server::HandleClientPacket(std::shared_ptr<ClientSession> session)
+bool Server::SetNonBlocking(SOCKET sock, bool nonBlocking)
 {
-    PacketHeader header;
-    if (!RecvFixedSize(session->socket, &header, sizeof(header)))
+    u_long mode = nonBlocking ? 1 : 0;
+    if (ioctlsocket(sock, FIONBIO, &mode) == SOCKET_ERROR)
     {
-        std::cout << "[Server] Client disconnected (recv header failed): " << GetClientInfo(session) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+void Server::RecvToBuffer(std::shared_ptr<ClientSession> session)
+{
+    if (!session || session->socket == INVALID_SOCKET) return;
+
+    char tempBuf[4096];
+    int ret = recv(session->socket, tempBuf, sizeof(tempBuf), 0);
+
+    if (ret > 0)
+    {
+        session->recvBuffer.insert(session->recvBuffer.end(), tempBuf, tempBuf + ret);
+        // 更新心跳时间，因为收到了数据，说明客户端还活着
+        session->lastHeartbeatTime = std::chrono::steady_clock::now();
+    }
+    else if (ret == 0)
+    {
+        std::cout << "[Server] Client disconnected (closed): " << GetClientInfo(session) << std::endl;
         closesocket(session->socket);
         std::lock_guard<std::mutex> lock(m_clientsMutex);
         m_clients.erase(session->socket);
-        return;
     }
-
-    if (header.magic != PACKET_MAGIC)
+    else
     {
-        std::cout << "[Server] Invalid magic from client: " << GetClientInfo(session) << std::endl;
-        closesocket(session->socket);
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
-        m_clients.erase(session->socket);
-        return;
-    }
-
-    std::vector<char> body;
-    if (header.body_len > 0)
-    {
-        body.resize(header.body_len);
-        if (!RecvFixedSize(session->socket, body.data(), header.body_len))
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK)
         {
-            std::cout << "[Server] Client disconnected (recv body failed): " << GetClientInfo(session) << std::endl;
+            std::cout << "[Server] Client disconnected (error " << err << "): " << GetClientInfo(session) << std::endl;
+            closesocket(session->socket);
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            m_clients.erase(session->socket);
+        }
+    }
+}
+
+void Server::ProcessBuffer(std::shared_ptr<ClientSession> session)
+{
+    if (!session || session->socket == INVALID_SOCKET) return;
+
+    // 循环处理 buffer 中的数据包
+    while (session->recvBuffer.size() >= sizeof(PacketHeader))
+    {
+        PacketHeader* rawHeader = reinterpret_cast<PacketHeader*>(session->recvBuffer.data());
+        
+        PacketHeader header;
+        header.magic = ntohs(rawHeader->magic);
+        header.version = ntohs(rawHeader->version);
+        header.cmd = ntohs(rawHeader->cmd);
+        header.seq = ntohs(rawHeader->seq);
+        header.body_len = NetworkToHost64(rawHeader->body_len);
+
+        if (header.magic != PACKET_MAGIC)
+        {
+            std::cout << "[Server] Invalid magic from client: " << GetClientInfo(session) << std::endl;
             closesocket(session->socket);
             std::lock_guard<std::mutex> lock(m_clientsMutex);
             m_clients.erase(session->socket);
             return;
         }
+
+        // 校验包体长度
+        if (header.body_len > MAX_PACKET_BODY_SIZE)
+        {
+            std::cout << "[Server] Packet too large (" << header.body_len << " bytes) from " << GetClientInfo(session) << ". Disconnecting." << std::endl;
+            closesocket(session->socket);
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            m_clients.erase(session->socket);
+            return;
+        }
+
+        size_t totalPacketSize = sizeof(PacketHeader) + header.body_len;
+        if (session->recvBuffer.size() >= totalPacketSize)
+        {
+            std::vector<char> body;
+            if (header.body_len > 0)
+            {
+                body.assign(session->recvBuffer.begin() + sizeof(PacketHeader), session->recvBuffer.begin() + totalPacketSize);
+            }
+
+            HandlePacket(session, header, body);
+
+            // 移除已处理数据 (可能 socket 已经被 HandlePacket 关闭了，所以要检查)
+             if (m_clients.find(session->socket) != m_clients.end())
+             {
+                 session->recvBuffer.erase(session->recvBuffer.begin(), session->recvBuffer.begin() + totalPacketSize);
+             }
+             else
+             {
+                 return;
+             }
+        }
+        else
+        {
+            break;
+        }
     }
+}
 
-    // Refresh heartbeat
-    session->lastHeartbeatTime = std::chrono::steady_clock::now();
-
+void Server::HandlePacket(std::shared_ptr<ClientSession> session, const PacketHeader& header, const std::vector<char>& body)
+{
     CommandType cmd = static_cast<CommandType>(header.cmd);
     switch (cmd)
     {
@@ -253,19 +358,19 @@ void Server::OnLoginReq(std::shared_ptr<ClientSession> session, const std::vecto
 
             // Send LoginRes (Success)
             std::string msg = "Success";
-            SendPacket(session->socket, static_cast<uint16_t>(CommandType::LoginRes), msg.c_str(), static_cast<uint32_t>(msg.size()));
+            SendPacket(session->socket, static_cast<uint16_t>(CommandType::LoginRes), msg.c_str(), static_cast<uint64_t>(msg.size()));
         }
         else
         {
             // Fail
             std::string msg = "Fail: Invalid format";
-            SendPacket(session->socket, static_cast<uint16_t>(CommandType::LoginRes), msg.c_str(), static_cast<uint32_t>(msg.size()));
+            SendPacket(session->socket, static_cast<uint16_t>(CommandType::LoginRes), msg.c_str(), static_cast<uint64_t>(msg.size()));
         }
     }
     else
     {
          std::string msg = "Fail: Format error";
-         SendPacket(session->socket, static_cast<uint16_t>(CommandType::LoginRes), msg.c_str(), static_cast<uint32_t>(msg.size()));
+         SendPacket(session->socket, static_cast<uint16_t>(CommandType::LoginRes), msg.c_str(), static_cast<uint64_t>(msg.size()));
     }
 }
 
@@ -299,46 +404,75 @@ void Server::BroadcastMessage(const std::string& msg, SOCKET excludeSock)
     {
         if (pair.first != excludeSock && pair.second->isAuthenticated)
         {
-            SendPacket(pair.first, static_cast<uint16_t>(CommandType::MessageRes), msg.c_str(), static_cast<uint32_t>(msg.size()));
+            SendPacket(pair.second, static_cast<uint16_t>(CommandType::MessageRes), msg.c_str(), static_cast<uint64_t>(msg.size()));
         }
     }
 }
 
-bool Server::SendPacket(SOCKET sock, uint16_t cmd, const void* data, uint32_t len)
+bool Server::SendPacket(SOCKET sock, uint16_t cmd, const void* data, uint64_t len)
 {
-    if (sock == INVALID_SOCKET) return false;
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    auto it = m_clients.find(sock);
+    if (it != m_clients.end()) 
+    {
+        return SendPacket(it->second, cmd, data, len);
+    }
+    return false;
+}
+
+bool Server::SendPacket(std::shared_ptr<ClientSession> session, uint16_t cmd, const void* data, uint64_t len)
+{
+    if (!session || session->socket == INVALID_SOCKET) return false;
 
     std::vector<char> buffer(sizeof(PacketHeader) + len);
     PacketHeader* header = reinterpret_cast<PacketHeader*>(buffer.data());
     
-    header->magic = PACKET_MAGIC;
-    header->version = PACKET_VERSION;
-    header->cmd = cmd;
-    header->seq = 0;
-    header->body_len = len;
+    header->magic = htons(PACKET_MAGIC);
+    header->version = htons(PACKET_VERSION);
+    header->cmd = htons(cmd);
+    header->seq = htons(0);
+    header->body_len = HostToNetwork64(len);
 
     if (len > 0 && data != nullptr)
     {
         memcpy(buffer.data() + sizeof(PacketHeader), data, len);
     }
 
-    int totalSent = 0;
-    int totalSize = static_cast<int>(buffer.size());
-    const char* bufPtr = buffer.data();
-
-    while (totalSent < totalSize)
     {
-        int sent = send(sock, bufPtr + totalSent, totalSize - totalSent, 0);
-        if (sent == SOCKET_ERROR)
-        {
-            return false;
-        }
-        totalSent += sent;
+        std::lock_guard<std::mutex> lock(session->sendMutex);
+        session->sendBuffer.insert(session->sendBuffer.end(), buffer.begin(), buffer.end());
     }
-
     return true;
 }
 
+void Server::SendFromBuffer(std::shared_ptr<ClientSession> session)
+{
+    std::lock_guard<std::mutex> lock(session->sendMutex);
+    if (session->sendBuffer.empty()) return;
+    if (session->socket == INVALID_SOCKET) return;
+
+    int ret = send(session->socket, session->sendBuffer.data(), static_cast<int>(session->sendBuffer.size()), 0);
+
+    if (ret > 0)
+    {
+        session->sendBuffer.erase(session->sendBuffer.begin(), session->sendBuffer.begin() + ret);
+    }
+    else if (ret == 0)
+    {
+        // 对方关闭？
+    }
+    else
+    {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK)
+        {
+             std::cout << "[Server] Send failed error: " << err << " for " << GetClientInfo(session) << std::endl;
+             // 这里通常不直接关闭，而是等下一次 recv 失败或心跳超时来处理关闭
+             // 或者在这里标记 session 为 dead
+        }
+    }
+}
+/*
 bool Server::RecvFixedSize(SOCKET sock, void* buf, int len)
 {
     int totalRecv = 0;
@@ -358,7 +492,7 @@ bool Server::RecvFixedSize(SOCKET sock, void* buf, int len)
     }
     return true;
 }
-
+*/
 std::string Server::GetClientInfo(const std::shared_ptr<ClientSession>& session)
 {
     if (!session) return "Unknown";

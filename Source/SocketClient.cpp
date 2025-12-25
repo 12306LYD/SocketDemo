@@ -37,6 +37,12 @@ void Client::Start(const std::string& ip, int port)
     m_running = true;
     m_state = ClientState::Disconnected;
 
+    m_recvBuffer.clear(); // 清空缓冲区
+    {
+        std::lock_guard<std::mutex> lock(m_sendBufferMutex);
+        m_sendBuffer.clear();
+    }
+
     m_thread = std::thread(&Client::NetworkThreadFunc, this);
     return;
 }
@@ -52,15 +58,156 @@ void Client::Stop()
     return;
 }
 
-void Client::CloseSocket()
+
+bool Client::SendChatMessage(const std::string& msg)
 {
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    if (m_socket != INVALID_SOCKET)
+    if (m_state != ClientState::Authenticated)
     {
-        closesocket(m_socket);
-        m_socket = INVALID_SOCKET;
+        std::cout << "[Client] Cannot send message, not authenticated." << std::endl;
+        return false;
     }
-    return;
+
+    return SendPacket(static_cast<uint16_t>(CommandType::MessageReq), msg.c_str(), static_cast<uint64_t>(msg.size()));
+}
+
+
+void Client::NetworkThreadFunc()
+{
+    while (m_running)
+    {
+        // ------------------------------------------------------------------
+        // 1. 连接状态维护
+        // ------------------------------------------------------------------
+        // 如果当前未连接，尝试连接服务器
+        if (m_socket == INVALID_SOCKET)
+        {
+            if (ConnectToServer())
+            {
+                // 连接成功，初始化心跳和时间戳
+                m_state = ClientState::Connected;
+                m_lastHeartbeatReqTime = GetTickCount64();
+                m_lastPacketRecvTime = GetTickCount64();
+                std::cout << "[Client] Connected to server " << m_serverIp << ":" << m_serverPort << std::endl;
+            }
+            else
+            {
+                // 连接失败，等待 3 秒后重试 (避免死循环占用 CPU)
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                continue;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 2. 准备 IO 多路复用 (Select 模型)
+        // ------------------------------------------------------------------
+        // Select 模型需要两个集合：
+        // readfds: 监听是否可读 (有数据到来)
+        // writefds: 监听是否可写 (发送缓冲区有数据需要发出)
+
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(m_socket, &readfds); // 始终监听可读事件
+
+        fd_set writefds;
+        FD_ZERO(&writefds);
+
+        bool hasDataToSend = false;
+        {
+            // 检查发送缓冲区是否有积压数据
+            std::lock_guard<std::mutex> lock(m_sendBufferMutex);
+            if (!m_sendBuffer.empty())
+            {
+                FD_SET(m_socket, &writefds); // 只有当有数据要发时，才监听可写事件
+                hasDataToSend = true;
+            }
+        }
+
+        // 设置超时时间 (10ms)
+        // 这个时间决定了网络线程的响应频率，10ms 是个比较平衡的值
+        timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 10000; // 10ms
+
+        // ------------------------------------------------------------------
+        // 3. 等待 IO 事件 (Select)
+        // ------------------------------------------------------------------
+        // select 会阻塞等待，直到：
+        // a. 有数据可读 (Socket 接收缓冲区有数据)
+        // b. 可写 (Socket 发送缓冲区有空位且我们在监听 writefds)
+        // c. 超时 (10ms)
+        // d. 出错
+        int ret = select(0, &readfds, hasDataToSend ? &writefds : NULL, NULL, &tv);
+
+        if (ret == SOCKET_ERROR)
+        {
+            // Select 出错通常意味着 Socket 异常，需要重连
+            // 这里简化处理，直接关闭 Socket 触发重连流程
+            CloseSocket();
+            m_state = ClientState::Disconnected;
+            continue;
+        }
+
+        // ------------------------------------------------------------------
+        // 4. 处理 IO 事件
+        // ------------------------------------------------------------------
+        // ret > 0 表示有事件发生
+        if (ret > 0)
+        {
+            // 4.1 处理读事件 (Recv)
+            if (FD_ISSET(m_socket, &readfds))
+            {
+                RecvToBuffer();  // 从网卡搬运数据到内存缓冲区
+                ProcessBuffer(); // 解析缓冲区，切包并处理业务
+            }
+
+            // 4.2 处理写事件 (Send)
+            if (hasDataToSend && FD_ISSET(m_socket, &writefds))
+            {
+                SendFromBuffer(); // 将内存缓冲区的数据发送到网卡
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 5. 心跳与超时检测
+        // ------------------------------------------------------------------
+        // 即使没有 IO 事件 (ret == 0)，也需要定期检查心跳
+
+        ULONGLONG now = GetTickCount64();
+
+        // 5.1 发送心跳包 (每 5 秒一次)
+        if (now - m_lastHeartbeatReqTime >= 5000)
+        {
+            if (m_state == ClientState::Authenticated)
+            {
+                // 发送心跳请求 (放入发送缓冲区)
+                SendPacket(static_cast<uint16_t>(CommandType::HeartbeatReq), m_deviceId.c_str(), m_deviceId.size());
+            }
+            m_lastHeartbeatReqTime = now;
+        }
+
+        // 5.2 检测超时断线 (15 秒未收到任何包)
+        if (now - m_lastPacketRecvTime >= 15000)
+        {
+            std::cout << "[Client] Timeout (no data from server), disconnecting..." << std::endl;
+            CloseSocket();
+            m_state = ClientState::Disconnected;
+        }
+
+        // ------------------------------------------------------------------
+        // 6. 自动登录逻辑
+        // ------------------------------------------------------------------
+        // 如果连接成功但未登录，自动发起登录
+        if (m_state == ClientState::Connected)
+        {
+            // Send Login Request
+            std::string loginData = m_username + "|" + m_password;
+            std::cout << "[Client] Sending LoginReq..." << std::endl;
+            if (SendPacket(static_cast<uint16_t>(CommandType::LoginReq), loginData.c_str(), static_cast<uint64_t>(loginData.size())))
+            {
+                m_state = ClientState::Authenticating;
+            }
+        }
+    }
 }
 
 bool Client::ConnectToServer()
@@ -88,235 +235,210 @@ bool Client::ConnectToServer()
         std::lock_guard<std::mutex> lock(m_socketMutex);
         m_socket = s;
     }
-    
+
+    // 连接成功后，设置为非阻塞模式
+    if (!SetNonBlocking(true))
+    {
+        std::cout << "[Client] Failed to set non-blocking mode." << std::endl;
+        CloseSocket();
+        return false;
+    }
+
     std::cout << "[Client] Connected to server " << m_serverIp << ":" << m_serverPort << std::endl;
     return true;
 }
 
-bool Client::SendPacket(uint16_t cmd, const void* data, uint32_t len)
+bool Client::SetNonBlocking(bool nonBlocking)
 {
-    std::lock_guard<std::mutex> lock(m_socketMutex);
-    if (m_socket == INVALID_SOCKET)
+    u_long mode = nonBlocking ? 1 : 0;
+    if (ioctlsocket(m_socket, FIONBIO, &mode) == SOCKET_ERROR)
     {
         return false;
     }
-    // Prepare packet
-    // Total size = header + body
-    // We send header first, then body, or combine them to avoid multiple syscalls
-    // For small packets, combining is better.
-    
+    return true;
+}
+
+
+void Client::CloseSocket()
+{
+    std::lock_guard<std::mutex> lock(m_socketMutex);
+    if (m_socket != INVALID_SOCKET)
+    {
+        closesocket(m_socket);
+        m_socket = INVALID_SOCKET;
+    }
+    return;
+}
+
+
+
+bool Client::SendPacket(uint16_t cmd, const void* data, uint64_t len)
+{
+    // 这里不再直接 send，而是追加到 buffer
+    // 注意：这里不需要锁 m_socketMutex，因为我们不操作 socket
+    // 但我们需要锁 m_sendBufferMutex，因为 SendPacket 可能被业务线程调用，而 NetworkThread 也会访问 buffer
+
+    if (m_state == ClientState::Disconnected)
+    {
+        return false;
+    }
+
     std::vector<char> buffer(sizeof(PacketHeader) + len);
     PacketHeader* header = reinterpret_cast<PacketHeader*>(buffer.data());
     
-    header->magic = PACKET_MAGIC;
-    header->version = PACKET_VERSION;
-    header->cmd = cmd;
-    header->seq = 0; // TODO: Increment seq
-    header->body_len = len;
+    header->magic = htons(PACKET_MAGIC);
+    header->version = htons(PACKET_VERSION);
+    header->cmd = htons(cmd);
+    header->seq = 0; // seq 也应该 htons(0)，虽然 0 是一样的
+    header->body_len = HostToNetwork64(len);
 
     if (len > 0 && data != nullptr)
     {
         memcpy(buffer.data() + sizeof(PacketHeader), data, len);
     }
 
-    int totalSent = 0;
-    int totalSize = static_cast<int>(buffer.size());
-    const char* bufPtr = buffer.data();
-
-    // 循环发送数据，确保所有数据都发送完毕
-    // TCP 是流式协议，send 返回发送成功的字节数，可能小于我们请求发送的长度
-    while (totalSent < totalSize)
     {
-        // 发送剩余数据：bufPtr + totalSent 是当前偏移，totalSize - totalSent 是剩余大小
-        int sent = send(m_socket, bufPtr + totalSent, totalSize - totalSent, 0);
-        
-        // 如果返回 SOCKET_ERROR，说明网络出错（如连接断开）
-        if (sent == SOCKET_ERROR)
-        {
-            std::cout << "[Client] Send failed error: " << WSAGetLastError() << std::endl;
-            return false;
-        }
-        
-        // 累加已发送的字节数，继续下一轮循环发送剩余部分
-        totalSent += sent;
+        std::lock_guard<std::mutex> lock(m_sendBufferMutex);
+        m_sendBuffer.insert(m_sendBuffer.end(), buffer.begin(), buffer.end());
     }
 
     return true;
 }
 
-bool Client::RecvFixedSize(void* buf, int len)
+void Client::SendFromBuffer()
 {
-    // m_socketMutex is NOT locked here because this is called only by the network thread
-    // and we assume only network thread reads. Send uses mutex because it can be called from main thread.
-    // However, if CloseSocket is called from main thread, m_socket might become INVALID.
-    // So we should check m_socket, but strictly locking reading might block sending.
-    // Usually, we rely on the fact that if socket is closed, recv returns error.
-    
+    std::lock_guard<std::mutex> lock(m_sendBufferMutex);
+    if (m_sendBuffer.empty())
+    {
+        return;
+    }
     if (m_socket == INVALID_SOCKET)
     {
-        return false;
+        return;
     }
-
-    int totalRecv = 0;
-    char* bufPtr = (char*)buf;
-
-    while (totalRecv < len)
+    // 尝试发送整个缓冲区
+    // 注意：send 在非阻塞模式下可能只发送一部分，或者返回 EWOULDBLOCK
+    int ret = send(m_socket, m_sendBuffer.data(), static_cast<int>(m_sendBuffer.size()), 0);
+    
+    if (ret > 0)
     {
-        int ret = recv(m_socket, bufPtr + totalRecv, len - totalRecv, 0);
-        if (ret > 0)
-        {
-            totalRecv += ret;
-        }
-        else if (ret == 0)
-        {
-            // Connection closed
-            return false;
-        }
-        else
-        {
-            // Error
-            return false;
-        }
+        // 发送成功了 ret 字节，从缓冲区移除
+        m_sendBuffer.erase(m_sendBuffer.begin(), m_sendBuffer.begin() + ret);
     }
-    return true;
+    else if (ret == 0)
+    {
+        // 对方关闭连接？通常 send 返回 0 比较少见，除非发 0 字节
+    }
+    else
+    {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK)
+        {
+            std::cout << "[Client] Send failed error: " << err << std::endl;
+            CloseSocket();
+            m_state = ClientState::Disconnected;
+        }
+        // 如果是 WSAEWOULDBLOCK，说明内核缓冲区满了，什么都不做，下次再试
+    }
 }
 
-void Client::ReceiveAndProcessPacket()
+void Client::RecvToBuffer()
 {
-    PacketHeader header;
-    if (!RecvFixedSize(&header, sizeof(header)))
+    if (m_socket == INVALID_SOCKET) return;
+
+    char tempBuf[4096];
+    // 非阻塞模式下，recv 会立即返回
+    int ret = recv(m_socket, tempBuf, sizeof(tempBuf), 0);
+    
+    if (ret > 0)
     {
-        std::cout << "[Client] Recv header failed, disconnecting." << std::endl;
+        // 收到数据，追加到缓冲区
+        m_recvBuffer.insert(m_recvBuffer.end(), tempBuf, tempBuf + ret);
+        m_lastPacketRecvTime = GetTickCount64();
+    }
+    else if (ret == 0)
+    {
+        // 连接关闭
+        std::cout << "[Client] Connection closed by server." << std::endl;
         CloseSocket();
         m_state = ClientState::Disconnected;
-        return;
     }
-
-    if (header.magic != PACKET_MAGIC)
+    else
     {
-        std::cout << "[Client] Invalid magic, disconnecting." << std::endl;
-        CloseSocket();
-        m_state = ClientState::Disconnected;
-        return;
-    }
-
-    std::vector<char> body;
-    if (header.body_len > 0)
-    {
-        body.resize(header.body_len);
-        if (!RecvFixedSize(body.data(), header.body_len))
+        int err = WSAGetLastError();
+        // 在非阻塞模式下，WSAEWOULDBLOCK 表示“现在没数据，稍后再试”，这不是错误
+        if (err != WSAEWOULDBLOCK)
         {
-            std::cout << "[Client] Recv body failed, disconnecting." << std::endl;
+            std::cout << "[Client] Recv failed error: " << err << std::endl;
+            CloseSocket();
+            m_state = ClientState::Disconnected;
+        }
+    }
+}
+
+void Client::ProcessBuffer()
+{
+    // 循环处理 buffer 中的数据包
+    while (m_recvBuffer.size() >= sizeof(PacketHeader))
+    {
+        // 偷看头部
+        // 注意：这里拿到的指针指向的数据是网络字节序，不能直接读值判断，必须先转换
+        PacketHeader* rawHeader = reinterpret_cast<PacketHeader*>(m_recvBuffer.data());
+        
+        // 转换为主机字节序
+        PacketHeader header;
+        header.magic = ntohs(rawHeader->magic);
+        header.version = ntohs(rawHeader->version);
+        header.cmd = ntohs(rawHeader->cmd);
+        header.seq = ntohs(rawHeader->seq);
+        header.body_len = NetworkToHost64(rawHeader->body_len);
+
+        // 校验魔数
+        if (header.magic != PACKET_MAGIC)
+        {
+            std::cout << "[Client] Invalid magic in buffer, clearing buffer and disconnecting." << std::endl;
+            m_recvBuffer.clear();
             CloseSocket();
             m_state = ClientState::Disconnected;
             return;
         }
-    }
 
-    m_lastPacketRecvTime = GetTickCount64();
-    HandlePacket(header, body);
-    return;
-}
-
-void Client::NetworkThreadFunc()
-{
-    while (m_running)
-    {
-        // 1. Connection Management
-        if (m_state == ClientState::Disconnected)
+        // 校验包体长度
+        if (header.body_len > MAX_PACKET_BODY_SIZE)
         {
-            if (ConnectToServer())
-            {
-                m_state = ClientState::Connected;
-                m_lastPacketRecvTime = GetTickCount64();
-                m_lastHeartbeatReqTime = GetTickCount64();
-            }
-            else
-            {
-                // Retry every 3 seconds
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                continue;
-            }
-        }
-
-        if (m_socket == INVALID_SOCKET)
-        {
+            std::cout << "[Client] Packet too large (" << header.body_len << " bytes), limit is " << MAX_PACKET_BODY_SIZE << ". Disconnecting." << std::endl;
+            m_recvBuffer.clear();
+            CloseSocket();
             m_state = ClientState::Disconnected;
-            continue;
+            return;
         }
 
-        // 2. Select (Multiplexing)
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(m_socket, &readfds);
-
-        timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 100 * 1000; // 100ms
-
-        int ret = select(0, &readfds, NULL, NULL, &tv);
-
-        // ret > 0: 表示有 Socket 就绪 (有数据可读)
-        if (ret > 0)
+        // 检查包是否完整
+        size_t totalPacketSize = sizeof(PacketHeader) + header.body_len;
+        if (m_recvBuffer.size() >= totalPacketSize)
         {
-            if (FD_ISSET(m_socket, &readfds))
+            // 提取包体
+            std::vector<char> body;
+            if (header.body_len > 0)
             {
-                ReceiveAndProcessPacket();
+                body.assign(m_recvBuffer.begin() + sizeof(PacketHeader), m_recvBuffer.begin() + totalPacketSize);
             }
+
+            // 处理包
+            HandlePacket(header, body);
+
+            // 从 buffer 中移除已处理的包
+            m_recvBuffer.erase(m_recvBuffer.begin(), m_recvBuffer.begin() + totalPacketSize);
         }
-        // ret == 0: 表示超时 (在 tv 指定的时间内没有事件发生)
-        // 此时我们不处理任何数据，而是继续循环，以便执行下面的心跳检查等逻辑
-        else if (ret == 0)
-        {
-            // Timeout, do nothing, just continue loop
-        }
-        // ret < 0: 表示 select 调用出错 (通常意味着 Socket 异常)
         else
         {
-             std::cout << "[Client] Select error (ret=" << ret << "), disconnecting." << std::endl;
-             CloseSocket();
-             m_state = ClientState::Disconnected;
-        }
-
-        // 3. Logic Loop
-        if (m_state == ClientState::Connected)
-        {
-            // Send Login Request
-            std::string loginData = m_username + "|" + m_password;
-            std::cout << "[Client] Sending LoginReq..." << std::endl;
-            if (SendPacket(static_cast<uint16_t>(CommandType::LoginReq), loginData.c_str(), static_cast<uint32_t>(loginData.size())))
-            {
-                m_state = ClientState::Authenticating;
-            }
-            else
-            {
-                CloseSocket();
-                m_state = ClientState::Disconnected;
-            }
-        }
-        else if (m_state == ClientState::Authenticating)
-        {
-             // Wait for response, maybe check timeout here?
-             auto now = std::chrono::steady_clock::now();
-             // Simple timeout check: 10 seconds?
-        }
-        else if (m_state == ClientState::Authenticated)
-        {
-            // Heartbeat Logic
-            ULONGLONG now = GetTickCount64();
-            // GetTickCount64 返回的是毫秒，所以差值也是毫秒
-            if (now - m_lastHeartbeatReqTime >= 5000) // Send heartbeat every 5 seconds (5000ms)
-            {
-                std::string Temp = m_deviceId;
-                SendPacket(static_cast<uint16_t>(CommandType::HeartbeatReq), Temp.c_str(), Temp.size());
-                m_lastHeartbeatReqTime = now;
-                // std::cout << "[Client] Sent Heartbeat" << std::endl;
-            }
+            // 数据不够一个完整包，等待下次接收
+            break; 
         }
     }
-
-    return;
 }
+
+
 
 void Client::HandlePacket(const PacketHeader& header, const std::vector<char>& body)
 {
@@ -379,15 +501,6 @@ void Client::OnMessageRes(const std::vector<char>& body)
     return;
 }
 
-bool Client::SendChatMessage(const std::string& msg)
-{
-    if (m_state != ClientState::Authenticated)
-    {
-        std::cout << "[Client] Cannot send message, not authenticated." << std::endl;
-        return false;
-    }
-    
-    return SendPacket(static_cast<uint16_t>(CommandType::MessageReq), msg.c_str(), static_cast<uint32_t>(msg.size()));
-}
+
 
 
