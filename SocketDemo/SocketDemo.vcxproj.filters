@@ -26,6 +26,12 @@
     <ClCompile Include="..\Source\DataDefine.cpp">
       <Filter>Source</Filter>
     </ClCompile>
+    <ClCompile Include="..\Source\SocketClientSsl.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="..\Source\SocketServerSsl.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\Source\SocketClient.h">
@@ -35,6 +41,12 @@
       <Filter>Source</Filter>
     </ClInclude>
     <ClInclude Include="..\Source\DataDefine.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Source\SocketClientSsl.h">
+      <Filter>Source</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Source\SocketServerSsl.h">
       <Filter>Source</Filter>
     </ClInclude>
   </ItemGroup>
